@@ -781,15 +781,27 @@ function renderTransactions(){
 }
 
 async function deleteTx(id){
-  showConfirm('Delete Transaction?','This will permanently remove this entry.',async()=>{
-    transactions=transactions.filter(t=>String(t.id)!==String(id));
-    renderTransactions();renderMonthly();
-    updateGoalsFromTransactions();
-    renderPortfolio();
-    await saveTx();
-    await saveGoals();
-    showToast('Transaction deleted');
+  // find the row and show inline confirm
+  const rows=document.querySelectorAll('#tx-tbody tr');
+  rows.forEach(row=>{
+    if(row.getAttribute('data-id')===String(id)){
+      const actionCell=row.querySelector('td:last-child');
+      actionCell.innerHTML=`
+        <span style="font-size:11px;color:#D85A30;font-weight:500;margin-right:4px">Sure?</span>
+        <button class="btn btn-red btn-sm" style="margin-right:3px" onclick="confirmDeleteTx('${id}')">Yes</button>
+        <button class="btn btn-sm" style="background:#f5f5f0;color:#555;border:0.5px solid #e0e0d8" onclick="renderTransactions()">No</button>`;
+    }
   });
+}
+
+async function confirmDeleteTx(id){
+  transactions=transactions.filter(t=>String(t.id)!==String(id));
+  renderTransactions();renderMonthly();
+  updateGoalsFromTransactions();
+  renderPortfolio();
+  await saveTx();
+  await saveGoals();
+  showToast('Transaction deleted');
 }
 
 function openEditModal(id){
