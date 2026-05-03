@@ -190,7 +190,7 @@ select.inp{cursor:pointer}
     </div>
 
     <div class="card" style="padding:0">
-      <table class="tbl"><thead><tr><th>Date</th><th>Description</th><th>Amount (BDT)</th><th>Category</th><th>Subcategory</th><th></th><th></th></tr></thead><tbody id="tx-tbody"></tbody></table>
+      <table class="tbl"><thead><tr><th>Date</th><th>Description</th><th>Amount (BDT)</th><th>Category</th><th>Subcategory</th><th>Actions</th></tr></thead><tbody id="tx-tbody"></tbody></table>
     </div>
   </div>
 
@@ -349,6 +349,19 @@ select.inp{cursor:pointer}
 </div>
 <div class="toast" id="toast"></div>
 
+<!-- CUSTOM CONFIRM MODAL (works inside Notion iframe) -->
+<div id="confirm-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.4);z-index:2000;align-items:center;justify-content:center">
+  <div style="background:#fff;border-radius:10px;padding:20px;width:320px;max-width:95vw;box-shadow:0 8px 32px rgba(0,0,0,0.2);text-align:center">
+    <div style="font-size:22px;margin-bottom:8px">🗑️</div>
+    <div style="font-size:14px;font-weight:500;margin-bottom:6px" id="confirm-title">Delete?</div>
+    <div style="font-size:12px;color:#888;margin-bottom:16px" id="confirm-msg">This action cannot be undone.</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-red" onclick="confirmYes()" style="flex:1">Yes, Delete</button>
+      <button onclick="confirmNo()" style="flex:1;padding:6px 14px;background:#f5f5f0;color:#555;border:0.5px solid #e0e0d8;border-radius:4px;cursor:pointer;font-size:12px">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── CONFIG ────────────────────────────────────────────────────
 const API = 'https://script.google.com/macros/s/AKfycbxx0IwtnqVJejkK2u1Z8TCz251jLsN21viS-stvWGzepa9_KF3kKg0uW8eappNfrmah/exec';
@@ -408,7 +421,7 @@ function rowToTx(r){return {id:r[0],date:r[1],desc:r[2],amt:parseFloat(r[3])||0,
 function plannedToRow(p){return [p.cat,p.plan];}
 function rowToPlanned(r){return {cat:r[0],plan:parseFloat(r[1])||0};}
 
-function goalToRow(g){return [g.name,g.target,g.saved];}
+function goalToRow(g){return [g.name,g.target,g.saved||0];}
 function rowToGoal(r){return {name:r[0],target:parseFloat(r[1])||0,saved:parseFloat(r[2])||0};}
 
 function loanToRow(l){return [l.name,l.balance,l.paid];}
@@ -424,9 +437,9 @@ function rowToApplied(r){return {key:r[0],label:r[1],count:parseInt(r[2])||0,dat
 async function loadAll(){
   setSyncStatus('syncing','Loading...');
   try{
-    const [txRows,planRows,goalRows,loanRows,recRows,appRows] = await Promise.all([
+    const [txRows,planRows,goalRows,loanRows,recRows,appRows,settRows] = await Promise.all([
       gsGet('Transactions'), gsGet('Planned'), gsGet('Goals'),
-      gsGet('Loans'), gsGet('Recurring'), gsGet('Applied')
+      gsGet('Loans'), gsGet('Recurring'), gsGet('Applied'), gsGet('Settings')
     ]);
     transactions  = txRows.filter(r=>r[0]).map(rowToTx);
     planned       = planRows.filter(r=>r[0]).map(rowToPlanned);
@@ -434,6 +447,8 @@ async function loadAll(){
     loans         = loanRows.filter(r=>r[0]).map(rowToLoan);
     recurring     = recRows.filter(r=>r[0]).map(rowToRec);
     appliedMonths = appRows.filter(r=>r[0]).map(rowToApplied);
+    loadCustomFromRows(settRows);
+    refreshAllCatSelects();
     setSyncStatus('ok','Synced with Google Sheets');
     renderAll();
   }catch(e){
@@ -495,6 +510,7 @@ function loadLocal(){
 function renderAll(){
   renderMonthly();
   renderTransactions();
+  updateGoalsFromTransactions();
 }
 
 // ── PAGE NAV ──────────────────────────────────────────────────
@@ -513,13 +529,34 @@ function getMonthTx(y,m){
   return transactions.filter(t=>{const d=new Date(t.date);return d.getFullYear()===y&&d.getMonth()===m;});
 }
 
+// ── CUSTOM CONFIRM DIALOG ────────────────────────────────────
+let _confirmCallback=null;
+function showConfirm(title, msg, cb){
+  document.getElementById('confirm-title').textContent=title;
+  document.getElementById('confirm-msg').textContent=msg;
+  _confirmCallback=cb;
+  document.getElementById('confirm-modal').style.display='flex';
+}
+function confirmYes(){
+  document.getElementById('confirm-modal').style.display='none';
+  if(_confirmCallback)_confirmCallback();
+  _confirmCallback=null;
+}
+function confirmNo(){
+  document.getElementById('confirm-modal').style.display='none';
+  _confirmCallback=null;
+}
+
 // ── CARRY FORWARD HELPER ──────────────────────────────────────
-function getPrevMonthRemaining(y, m){
+// Recursively chains carry-forward across months with no income
+function getPrevMonthRemaining(y, m, depth=0){
+  if(depth>12) return 0; // safety: max 12 months back
   let py=y, pm=m-1;
   if(pm<0){pm=11;py--;}
   const prevTxs=getMonthTx(py,pm);
-  if(!prevTxs.length) return 0;
-  const pIncome=prevTxs.filter(t=>t.cat==='Income').reduce((s,t)=>s+t.amt,0);
+  // prev month carry forward from its own previous month
+  const prevCarry=getPrevMonthRemaining(py,pm,depth+1);
+  const pIncome=prevTxs.filter(t=>t.cat==='Income').reduce((s,t)=>s+t.amt,0)+prevCarry;
   const pOut=prevTxs.filter(t=>t.cat!=='Income').reduce((s,t)=>s+t.amt,0);
   const rem=pIncome-pOut;
   return rem>0?rem:0;
@@ -669,8 +706,24 @@ function renderGlance(expenses,bills,savings,investments,debt){
   cats.forEach(c=>{const pct=(c.val/total*100).toFixed(1);leg.innerHTML+=`<div class="legend-row"><span class="legend-dot" style="background:${c.color}"></span><span>${c.label}</span><span style="margin-left:auto">${pct}%</span></div>`;});
 }
 
-function prevMonth(){if(currentMonth===0){currentMonth=11;currentYear--;}else currentMonth--;renderMonthly();}
-function nextMonth(){if(currentMonth===11){currentMonth=0;currentYear++;}else currentMonth++;renderMonthly();}
+function prevMonth(){
+  if(currentMonth===0){currentMonth=11;currentYear--;}else currentMonth--;
+  syncMonthFilter();
+  renderMonthly();
+  renderTransactions();
+}
+function nextMonth(){
+  if(currentMonth===11){currentMonth=0;currentYear++;}else currentMonth++;
+  syncMonthFilter();
+  renderMonthly();
+  renderTransactions();
+}
+
+function syncMonthFilter(){
+  const val=currentYear+'-'+(String(currentMonth+1).padStart(2,'0'));
+  const fm=document.getElementById('filter-month');
+  if(fm) fm.value=val;
+}
 
 // ── TRANSACTIONS ──────────────────────────────────────────────
 async function addTransaction(){
@@ -693,8 +746,11 @@ async function addTransaction(){
   document.getElementById('tx-cat-custom').style.display='none';
   document.getElementById('tx-sub-custom').style.display='none';
   renderTransactions();renderMonthly();
+  updateGoalsFromTransactions();
+  renderPortfolio();
   showToast('Transaction added!');
   await saveTx();
+  await saveGoals();
 }
 
 function renderTransactions(){
@@ -709,37 +765,47 @@ function renderTransactions(){
     const catColor=t.cat==='Income'?'#1D9E75':t.cat==='Savings'?'#378ADD':t.cat==='Investments'?'#7F77DD':'#D85A30';
     const sign=t.cat==='Income'?'+':'-';
     const tr=document.createElement('tr');
+    tr.setAttribute('data-id', t.id);
     tr.innerHTML=`
       <td>${t.date}</td>
       <td>${t.desc}${t.recurring?` <span style="font-size:9px;background:#E1F5EE;color:#085041;padding:1px 5px;border-radius:3px">auto</span>`:''}</td>
       <td style="color:${t.cat==='Income'?'#1D9E75':'#D85A30'};font-weight:500">${sign}${fmt(t.amt)}</td>
       <td><span style="background:${catColor}22;color:${catColor};padding:2px 7px;border-radius:3px;font-size:10px;font-weight:500">${t.cat}</span></td>
       <td style="color:#888">${t.sub||'—'}</td>
-      <td><button class="btn btn-sm" style="background:#f5f5f0;color:#555;border:0.5px solid #e0e0d8" onclick="openEditModal('${t.id}')">&#9998; Edit</button></td>
-      <td><button class="btn btn-red btn-sm" onclick="deleteTx('${t.id}')">&#10005;</button></td>`;
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm" style="background:#378ADD22;color:#185FA5;border:0.5px solid #378ADD55;margin-right:4px" onclick="openEditModal('${t.id}')">&#9998; Edit</button>
+        <button class="btn btn-red btn-sm" onclick="deleteTx('${t.id}')">🗑 Del</button>
+      </td>`;
     tbody.appendChild(tr);
   });
 }
 
 async function deleteTx(id){
-  if(!confirm('Delete this transaction?'))return;
-  transactions=transactions.filter(t=>t.id!=id);
-  renderTransactions();renderMonthly();
-  await saveTx();
-  showToast('Deleted');
+  showConfirm('Delete Transaction?','This will permanently remove this entry.',async()=>{
+    transactions=transactions.filter(t=>String(t.id)!==String(id));
+    renderTransactions();renderMonthly();
+    updateGoalsFromTransactions();
+    renderPortfolio();
+    await saveTx();
+    await saveGoals();
+    showToast('Transaction deleted');
+  });
 }
 
 function openEditModal(id){
-  const t=transactions.find(t=>t.id==id);
-  if(!t)return;
-  document.getElementById('edit-id').value=t.id;
-  document.getElementById('edit-desc').value=t.desc;
-  document.getElementById('edit-amt').value=t.amt;
-  document.getElementById('edit-date').value=t.date;
-  populateCatSelect('edit-cat', t.cat);
-  populateSubSelect('edit-sub', t.cat, t.sub||'');
+  const t=transactions.find(t=>String(t.id)===String(id));
+  if(!t){showToast('Transaction not found',true);return;}
+  // populate all fields
+  document.getElementById('edit-id').value=String(t.id);
+  document.getElementById('edit-desc').value=t.desc||'';
+  document.getElementById('edit-amt').value=t.amt||0;
+  document.getElementById('edit-date').value=t.date||'';
+  populateCatSelect('edit-cat', t.cat||'Expenses');
+  if(t.cat==='Savings') refreshSavingsSubcategories();
+  populateSubSelect('edit-sub', t.cat||'Expenses', t.sub||'');
   document.getElementById('edit-cat-custom').style.display='none';
   document.getElementById('edit-sub-custom').style.display='none';
+  // show modal WITHOUT touching transactions array
   document.getElementById('edit-modal').style.display='flex';
 }
 
@@ -759,13 +825,18 @@ async function saveEdit(){
   const sub=subSel==='__add__'?subCustom:subSel;
   const date=document.getElementById('edit-date').value;
   if(!desc||!amt){alert('Please fill Description and Amount.');return;}
-  const t=transactions.find(t=>t.id==id);
-  if(t){t.desc=desc;t.amt=amt;t.cat=cat;t.sub=sub;t.date=date;}
+  const t=transactions.find(t=>String(t.id)===String(id));
+  if(!t){showToast('Could not find transaction to update',true);closeEditModal();return;}
+  // update in place — never delete
+  t.desc=desc;t.amt=amt;t.cat=cat;t.sub=sub;t.date=date;
   transactions.sort((a,b)=>new Date(b.date)-new Date(a.date));
   closeEditModal();
   renderTransactions();renderMonthly();
+  updateGoalsFromTransactions();
+  renderPortfolio();
   showToast('Transaction updated ✓');
   await saveTx();
+  await saveGoals();
 }
 
 // ── RECURRING ─────────────────────────────────────────────────
@@ -861,29 +932,96 @@ function renderRecHistory(){
 }
 
 // ── PORTFOLIO ─────────────────────────────────────────────────
-function renderPortfolio(){renderGoals();renderLoans();calcNetWorth();}
+function renderPortfolio(){
+  updateGoalsFromTransactions();
+  renderGoals();
+  renderLoans();
+  calcNetWorth();
+}
+
+// Auto-calculate saved amount for each goal from Savings transactions
+function updateGoalsFromTransactions(){
+  goals.forEach(g=>{
+    // sum all Savings transactions where subcategory matches goal name
+    const saved=transactions
+      .filter(t=>t.cat==='Savings' && t.sub && t.sub.toLowerCase()===g.name.toLowerCase())
+      .reduce((s,t)=>s+t.amt,0);
+    if(saved>0) g.saved=saved;
+  });
+  // also refresh savings subcategory dropdown with goal names
+  refreshSavingsSubcategories();
+}
+
+// Add goal names to Savings subcategory dropdown automatically
+function refreshSavingsSubcategories(){
+  const goalNames=goals.map(g=>g.name);
+  goalNames.forEach(n=>{
+    if(!DEFAULT_SUBS['Savings'].includes(n)){
+      if(!customSubs['Savings']) customSubs['Savings']=[];
+      if(!customSubs['Savings'].includes(n)) customSubs['Savings'].push(n);
+    }
+  });
+  // immediately repopulate dropdown if Savings is currently selected
+  const txCat=document.getElementById('tx-cat');
+  if(txCat && txCat.value==='Savings') populateSubSelect('tx-sub','Savings');
+  const editCat=document.getElementById('edit-cat');
+  if(editCat && editCat.value==='Savings') populateSubSelect('edit-sub','Savings');
+}
 
 async function addGoal(){
   const name=document.getElementById('g-name').value.trim();
   const target=parseFloat(document.getElementById('g-target').value)||0;
-  const saved=parseFloat(document.getElementById('g-saved').value)||0;
   if(!name||!target)return;
-  goals.push({name,target,saved});
-  document.getElementById('g-name').value='';document.getElementById('g-target').value='';document.getElementById('g-saved').value='';
-  renderGoals();calcNetWorth();await saveGoals();
+  // check if already exists
+  if(goals.find(g=>g.name.toLowerCase()===name.toLowerCase())){
+    showToast('Goal already exists!',true);return;
+  }
+  goals.push({name,target,saved:0});
+  document.getElementById('g-name').value='';
+  document.getElementById('g-target').value='';
+  document.getElementById('g-saved').value='';
+  updateGoalsFromTransactions();
+  refreshSavingsSubcategories();
+  renderGoals();calcNetWorth();
+  await saveGoals();
+  showToast('Goal added: '+name+' — Use Savings → '+name+' to track it');
 }
 
 function renderGoals(){
   const el=document.getElementById('goals-list');
-  if(!goals.length){el.innerHTML='<div class="empty-msg">No goals added yet</div>';return;}
+  if(!goals.length){el.innerHTML='<div class="empty-msg">No goals added yet. Add a goal and then save money toward it using Savings category with the goal name as subcategory.</div>';return;}
   el.innerHTML='';
   goals.forEach((g,i)=>{
     const pct=Math.min(100,g.target>0?(g.saved/g.target*100):0);
-    el.innerHTML+=`<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="font-size:12px;font-weight:500">${g.name}</span><span style="font-size:11px;color:#888">${fmt(g.saved)} / ${fmt(g.target)}</span></div><div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div><div style="display:flex;justify-content:space-between;margin-top:2px"><span style="font-size:10px;color:#1D9E75">${pct.toFixed(1)}% complete</span><button class="btn btn-red btn-sm" onclick="deleteGoal(${i})">&#10005;</button></div></div>`;
+    const remaining=g.target-g.saved;
+    const barColor=pct>=100?'#1D9E75':pct>=50?'#378ADD':'#BA7517';
+    el.innerHTML+=`
+      <div style="margin-bottom:12px;border:0.5px solid #e0e0d8;border-radius:8px;padding:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <span style="font-size:12px;font-weight:500">🎯 ${g.name}</span>
+          <button class="btn btn-red btn-sm" onclick="deleteGoal(${i})">&#10005;</button>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:#888;margin-bottom:6px">
+          <span>Saved: <strong style="color:#1D9E75">${fmt(g.saved)}</strong></span>
+          <span>Target: <strong>${fmt(g.target)}</strong></span>
+          <span>Remaining: <strong style="color:#D85A30">${fmt(remaining>0?remaining:0)}</strong></span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${barColor}"></div></div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px">
+          <span style="font-size:10px;color:${barColor};font-weight:500">${pct.toFixed(1)}% complete</span>
+          <span style="font-size:10px;color:#888">Add via Savings → ${g.name}</span>
+        </div>
+      </div>`;
   });
 }
 
-async function deleteGoal(i){goals.splice(i,1);renderGoals();calcNetWorth();await saveGoals();}
+async function deleteGoal(i){
+  goals.splice(i,1);
+  updateGoalsFromTransactions();
+  renderGoals();calcNetWorth();
+  await saveGoals();
+  showToast('Goal deleted');
+}
 
 async function addLoan(){
   const name=document.getElementById('l-name').value.trim();
@@ -920,21 +1058,41 @@ function calcNetWorth(){
 // ── CATEGORIES & SUBCATEGORIES ────────────────────────────────
 const DEFAULT_CATS = ['Income','Expenses','Bills','Savings','Investments','Debt','Cash'];
 const DEFAULT_SUBS = {
-  'Income':      ['Salary','Bonus','Side Income','Sanchayapatra Return','Interest','Freelance'],
-  'Expenses':    ['Grocery','Personal Care','Medical','Transport','Dining Out','Shopping','Mobile','Utilities','Education','Entertainment'],
-  'Bills':       ['Rent','Subscriptions','Electricity','Gas','Water','Internet'],
-  'Savings':     ['Bank Savings','Emergency Fund','FD','DPS'],
-  'Investments': ['Stock Market','Mutual Fund','DPS','Sanchayapatra'],
-  'Debt':        ['Personal Loan','Friend/Family','Bank Loan'],
-  'Cash':        ['Withdrawal','Cash In Hand','Cash Received'],
+  'Income':      ['Salary','Medical Reimbursement','Mobile Bill Reimbursement','Imprest Incoming','Sanchayapatra Profit','Bank Interest','Bonus','Festival Bonus','Side Income','Freelance'],
+  'Expenses':    ['Grocery','Personal Care','Medical','Transport','Bike Expense','Dining Out','Household','Clothing','Mobile','Utilities','Education','Entertainment','Father','Wife','Official Expense','Credit Card Bill','Others'],
+  'Bills':       ['Rent','Credit Card Bill','GP Bill','Subscriptions','Netflix','Prime Video','Notion','ChatGPT','Gemini','Claude Pro','Electricity','Gas','Water','Internet'],
+  'Savings':     ['Bank Savings','Emergency Fund','FD'],
+  'Investments': ['DPS','Sanchayapatra','Stock Market','Mutual Fund','FD'],
+  'Debt':        ['Personal Loan','Father','Friend/Family','Bank Loan','EMI'],
+  'Cash':        ['Cash Withdrawal','Cash In Hand','Cash Received','Cash Transfer'],
 };
 
-let customCats = JSON.parse(localStorage.getItem('custom_cats') || '[]');
-let customSubs = JSON.parse(localStorage.getItem('custom_subs') || '{}');
+let customCats = [];
+let customSubs = {};
 
-function saveCustom(){
-  localStorage.setItem('custom_cats', JSON.stringify(customCats));
-  localStorage.setItem('custom_subs', JSON.stringify(customSubs));
+// save custom cats/subs to Google Sheets "Settings" tab
+function customToRows(){
+  const rows=[];
+  customCats.forEach(c=>rows.push(['cat',c,'']));
+  Object.entries(customSubs).forEach(([cat,subs])=>subs.forEach(s=>rows.push(['sub',cat,s])));
+  return rows;
+}
+
+async function saveCustom(){
+  const rows=customToRows();
+  try{ await gsPost('Settings', rows.length?rows:[['_empty','','']]); }catch(e){}
+}
+
+function loadCustomFromRows(rows){
+  customCats=[];customSubs={};
+  rows.filter(r=>r[0]&&r[0]!=='_empty').forEach(r=>{
+    if(r[0]==='cat'&&r[1]&&!DEFAULT_CATS.includes(r[1])){
+      if(!customCats.includes(r[1]))customCats.push(r[1]);
+    } else if(r[0]==='sub'&&r[1]&&r[2]){
+      if(!customSubs[r[1]])customSubs[r[1]]=[];
+      if(!customSubs[r[1]].includes(r[2]))customSubs[r[1]].push(r[2]);
+    }
+  });
 }
 
 function getAllCats(){
@@ -1180,12 +1338,19 @@ initDropdowns();
 
 // update sub dropdown when cat changes in add form
 document.getElementById('tx-cat').addEventListener('change', function(){
-  if(this.value && this.value!=='__add__') populateSubSelect('tx-sub', this.value);
+  if(this.value && this.value!=='__add__'){
+    if(this.value==='Savings') refreshSavingsSubcategories();
+    populateSubSelect('tx-sub', this.value);
+  }
 });
 document.getElementById('edit-cat').addEventListener('change', function(){
-  if(this.value && this.value!=='__add__') populateSubSelect('edit-sub', this.value);
+  if(this.value && this.value!=='__add__'){
+    if(this.value==='Savings') refreshSavingsSubcategories();
+    populateSubSelect('edit-sub', this.value);
+  }
 });
 
+// load everything — renderAll is called INSIDE loadAll after data is ready
 loadAll();
 </script>
 </body>
